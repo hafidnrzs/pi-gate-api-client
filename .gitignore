@@ -1,0 +1,7 @@
+# Secrets and third-party docs: kept locally, never pushed
+config.json
+pc-api-*.json
+api-contract/
+
+__pycache__/
+.venv/

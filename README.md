@@ -224,11 +224,14 @@ scanner ──scan──> gate_agent ──POST /validate──> server
                       │
           token already used locally? ──yes──> DENY used_locally
                       │
+          network error / 5xx? ──yes──> offline decision (see below)
+                      │
           decision != allowed ──────────────> DENY <reason>
                       │ allowed
           mark token used (state/used_tokens.json)
                       │
-          pulse relay ── failed ──> POST /cancel, unmark, DENY gate_failed
+          pulse relay ── failed ──> unmark, POST /cancel (online only),
+                      │                DENY gate_failed
                       │   unknown ─> keep token used, DENY gate_unknown
                       │ opened
           POST /events (queued to state/pending_reports.jsonl on failure)
@@ -242,13 +245,45 @@ scanner ──scan──> gate_agent ──POST /validate──> server
 | `used_locally`       | Token already opened the barrier on this Pi (guide section 2 requires this check) |
 | server reasons       | e.g. `qr_tidak_terdaftar`, `qr_sudah_masuk`, `di_luar_jadwal`: barrier stays shut |
 | `payment_required`   | Late exit, payment needed. Not handled yet, barrier stays shut |
-| `server_unreachable` | Network error or HTTP 5xx. Barrier stays shut (no cache yet) |
 | `api_error_<status>` | 401/403/404: wrong key, IP or estate ID in `config.json` |
 | `gate_failed`        | Relay surely did not fire (ESP32 offline or refused). Permit cancelled, token can be scanned again |
 | `gate_unknown`       | Relay accepted the pulse but never confirmed. Token kept as used, no report sent |
+| `offline_cache`      | Server down, entry opened from the cached list          |
+| `offline_exit`       | Server down, exit opened because this Pi recorded the entry |
+| `offline_not_in_cache` | Server down, token not in the last synced list (e.g. registered after the last sync) |
+| `offline_too_early`, `offline_too_late` | Server down, token cached but outside its slot |
+| `offline_cache_expired` | Server down, no list synced yet or past `cache_valid_until` |
+| `offline_not_entered` | Server down, exit for a token this Pi never let in      |
 
-Queued reports are resent with `/events/batch` at startup and after every
-scan, reusing the same `event_id` so the server counts each once.
+Each `used_locally` record is per direction, so the same QR can enter once
+and exit once.
+
+### Offline fallback
+
+A background job runs at startup and every `sync_interval_s` (default 5
+minutes, as the guide suggests):
+
+1. `GET /entries?include_upcoming=1`: QR codes whose slot is running or
+   starts within 6 hours, each with `valid_from` and `valid_until`. Saved to
+   `state/qr_cache.json`, so it survives a reboot. A failed pull keeps the
+   previous list.
+2. If the pull worked, resend queued reports with `/events/batch`, reusing
+   the same `event_id` so the server counts each once.
+
+The cache is used **only** when `/validate` fails with a network error or
+HTTP 5xx. A `rejected` answer from the server is final and never replaced
+by the cache. Offline rules (guide "SKENARIO GANGGUAN"):
+
+- **Entry**: allowed only if the token is in the last synced list,
+  `valid_from <= Pi time < valid_until`, and the list is not past
+  `cache_valid_until`. A QR registered after the last sync is rejected.
+- **Exit**: allowed only if this Pi recorded the token's entry. The server
+  books any late fee as outstanding when the report arrives.
+- Offline opens are reported with a new `event_id` and the Pi's time as
+  `authorized_at`, queued until the server is back.
+
+Offline decisions depend on the Pi clock. The Pi has no battery clock, so
+check NTP sync with `timedatectl` (`System clock synchronized: yes`).
 
 ### Configuration
 
@@ -259,6 +294,7 @@ The agent reads the `agent` section of the same `config.json`:
 | `relay_port`       | ESP32-C3 serial port, e.g. `/dev/ttyACM0` (a `/dev/serial/by-id/...` path survives re-plugging) |
 | `relay_driver_dir` | Folder holding `test_relay.py` from `esp32c3-relay/pi`  |
 | `state_dir`        | Runtime state, relative to this folder (default `state`) |
+| `sync_interval_s`  | Cache pull and report retry interval (default 300)      |
 | `gates[]`          | One entry per scanner/barrier pair                      |
 | `gates[].direction`| `entry` or `exit`                                       |
 | `gates[].scanner`  | Scanner input device. Find it with `ls /dev/input/by-id/` |
@@ -317,8 +353,19 @@ server.
      *Admin web > Validasi QR Gerbang*.
 
    Scan a rejected QR code: no click, `DENY` with the reason.
-4. **Failure checks**: unplug the ESP32-C3 and scan, which should give
-   `DENY: gate_failed`. Stop the mock and scan: `DENY: server_unreachable`.
+   The log also shows `cache synced: N entries` at startup and every
+   `sync_interval_s`.
+4. **Offline fallback** (mock serves one cached token, `contoh-token-qr`):
+   start the agent and wait for `cache synced`, then stop the mock.
+   - Scan `contoh-token-qr`: `OPEN: offline_cache` plus `report ... queued
+     for retry`.
+   - Scan any other token: `DENY: offline_not_in_cache`.
+   - Start the mock again. At the next sync the log shows `flushed 1 queued
+     reports, 0 left` and the mock logs `POST .../events/batch`.
+
+   On site, pull the Pi's network cable instead of stopping the mock.
+5. **Failure checks**: unplug the ESP32-C3 and scan, which should give
+   `DENY: gate_failed`.
 
 To start over during testing, stop the agent and delete `state/`.
 
@@ -328,7 +375,7 @@ Each concern lives in one place in `gate_agent.py`:
 
 | Requirement                         | Where                                        |
 |-------------------------------------|----------------------------------------------|
-| Offline cache (guide section 1)     | `GateAgent.validate()`: on `server_unreachable`, decide from a cached `entries?include_upcoming=1` list |
+| Different offline rules             | `GateAgent.validate_offline()`, `QrCache.check()` |
 | Buzzer, LED, display feedback       | `GateAgent.on_result()`                       |
 | Exit payment (`payment_required`)   | `GateAgent._handle()`, after `validate()`     |
 | Heartbeat every minute (guide section 6) | new thread in `main()` calling `/heartbeat` with relay health |

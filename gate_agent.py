@@ -6,8 +6,9 @@ Runs on the Pi and wires three parts together:
   server   PC QR API, through gate_client.Client
   barrier  ESP32-C3 relay, through esp32c3-relay's RelayClient
 
-Rules follow api-contract/pc-qr-api-guide.txt sections 2 to 5. See README
-"Gate agent" for the flow and where to extend it.
+When the server is unreachable, entry scans fall back to a QR list cached
+by periodic sync. Rules follow api-contract/pc-qr-api-guide.txt sections 1
+to 5. See README "Gate agent" for the flow and where to extend it.
 
 Usage:
   python3 gate_agent.py                     # real scanners and relay
@@ -22,6 +23,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from gate_client import Client, now, token_of
@@ -39,33 +41,92 @@ class Result:
     response: dict = field(default_factory=dict)
 
 
+def parse_ts(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def write_atomic(path: Path, text: str):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 # Local state -------------------------------------------------------------
 
 class UsedTokens:
-    """Tokens whose barrier already opened, persisted across restarts.
+    """Tokens that opened a barrier, per direction, kept across restarts.
 
     The server re-allows a token if the open report is late, so the Pi
-    must reject re-scans itself (guide section 2).
+    must reject re-scans itself (guide section 2). The entry record also
+    lets an exit open offline (guide "SKENARIO GANGGUAN").
     """
 
     def __init__(self, path: Path):
         self.path = path
-        self._tokens = json.loads(path.read_text()) if path.exists() else {}
+        data = json.loads(path.read_text()) if path.exists() else {}
+        self._used = {"entry": data.get("entry", {}),
+                      "exit": data.get("exit", {})}
 
-    def __contains__(self, token):
-        return token in self._tokens
+    def has(self, direction, token):
+        return token in self._used[direction]
 
-    def add(self, token):
-        self._tokens[token] = now()
+    def add(self, direction, token):
+        self._used[direction][token] = now()
         self._save()
 
-    def discard(self, token):
-        if self._tokens.pop(token, None):
+    def discard(self, direction, token):
+        if self._used[direction].pop(token, None):
             self._save()
 
     def _save(self):
         # ponytail: grows forever, prune old entries if the file gets big
-        write_atomic(self.path, json.dumps(self._tokens, indent=1))
+        write_atomic(self.path, json.dumps(self._used, indent=1))
+
+
+class QrCache:
+    """Last QR list from GET /entries?include_upcoming=1 (guide section 1).
+
+    Only consulted when the server is unreachable. A QR registered after
+    the last sync is not in the list, so it is rejected.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = json.loads(path.read_text()) if path.exists() else {}
+
+    def refresh(self, api: Client):
+        """Pull a fresh list. Returns True on success; keeps the old list
+        otherwise."""
+        try:
+            status, resp = api.call("GET", "/entries?include_upcoming=1")
+        except OSError as e:
+            log.warning("cache sync failed: %r", e)
+            return False
+        if status != 200 or not isinstance(resp, dict) \
+                or not isinstance(resp.get("entries"), list):
+            log.warning("cache sync failed: HTTP %s", status)
+            return False
+        self.data = resp
+        write_atomic(self.path, json.dumps(resp, indent=1))
+        log.info("cache synced: %d entries, valid until %s",
+                 len(resp["entries"]), resp.get("cache_valid_until"))
+        return True
+
+    def check(self, token, at=None):
+        """Return "allowed" or the offline rejection code."""
+        at = at or datetime.now(timezone.utc)
+        until = self.data.get("cache_valid_until")
+        if not until or at >= parse_ts(until):
+            return "offline_cache_expired"
+        for e in self.data.get("entries", []):
+            if e.get("qr_token") != token:
+                continue
+            if e.get("valid_from") and at < parse_ts(e["valid_from"]):
+                return "offline_too_early"
+            if at >= parse_ts(e["valid_until"]):
+                return "offline_too_late"
+            return "allowed"
+        return "offline_not_in_cache"
 
 
 class Reporter:
@@ -107,10 +168,9 @@ class Reporter:
                   if x.strip()]
         if not queued:
             return
-        batch = queued[:200]
         try:
             status, resp = self.api.call("POST", "/events/batch",
-                                         {"events": batch})
+                                         {"events": queued[:200]})
         except OSError:
             return
         if status != 200:
@@ -121,12 +181,6 @@ class Reporter:
         write_atomic(self.path, "".join(json.dumps(e) + "\n" for e in left))
         log.info("flushed %d queued reports, %d left",
                  len(queued) - len(left), len(left))
-
-
-def write_atomic(path: Path, text: str):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
 
 
 # Barrier -----------------------------------------------------------------
@@ -175,16 +229,18 @@ class DryRunOpener:
 class GateAgent:
     """Decides what to do with one scan. Extension points:
 
-    validate()  add cache fallback here when the server is unreachable
-    on_result() add buzzer, LED or display feedback here
+    validate()          online decision from the server
+    validate_offline()  fallback decision when the server is unreachable
+    on_result()         add buzzer, LED or display feedback here
     """
 
     def __init__(self, api: Client, opener, used: UsedTokens,
-                 reporter: Reporter):
+                 reporter: Reporter, cache: QrCache):
         self.api = api
         self.opener = opener
         self.used = used
         self.reporter = reporter
+        self.cache = cache
         # ponytail: one scan at a time across gates, per-gate locks if slow
         self._lock = threading.Lock()
 
@@ -192,41 +248,52 @@ class GateAgent:
         with self._lock:
             result = self._handle(gate, value)
             self.on_result(gate, result)
-            self.reporter.flush()
         return result
 
+    def sync(self):
+        """Periodic job: refresh the QR cache, then resend queued reports."""
+        if self.cache.refresh(self.api):
+            with self._lock:
+                self.reporter.flush()
+
     def _handle(self, gate, value):
+        direction = gate["direction"]
         token = token_of(value.strip())
         if not token:
             return Result(False, "empty_scan")
-        if token in self.used:
+        if self.used.has(direction, token):
             return Result(False, "used_locally")
 
-        code, resp = self.validate(value, gate["direction"])
+        code, resp = self.validate(value, direction)
+        offline = code == "server_unreachable"
+        if offline:
+            code, resp = self.validate_offline(token, direction)
         if code != "allowed":
             return Result(False, code, resp)
 
         # Mark before opening so a re-scan cannot pass (guide section 3).
-        self.used.add(token)
+        self.used.add(direction, token)
         outcome = self.opener.open(gate)
         if outcome == "failed":
-            self.used.discard(token)
-            self.cancel(resp["event_id"], "gate_failed")
+            self.used.discard(direction, token)
+            if not offline:
+                self.cancel(resp["event_id"], "gate_failed")
             return Result(False, "gate_failed", resp)
         if outcome == "unknown":
             return Result(False, "gate_unknown", resp)
 
+        # Offline: new event_id and local authorized_at (guide section 3).
         self.reporter.send(self.api.event_body(
-            token, gate["direction"], resp["event_id"], resp["authorized_at"]))
+            token, direction, resp.get("event_id"), resp.get("authorized_at")))
         return Result(True, resp.get("reason", "allowed"), resp)
 
     def validate(self, value, direction):
         """Ask the server. Returns (code, response).
 
-        code is the decision ("allowed", "rejected", "payment_required"),
-        "server_unreachable" (network error or 5xx, cache may decide), or
-        "api_error_<status>" (config problem, never overridden by cache).
-        For "rejected", code is the server's reason instead.
+        code is the decision ("allowed", "payment_required"), the server's
+        reason for "rejected", "server_unreachable" (network error or 5xx,
+        cache may decide), or "api_error_<status>" (config problem, never
+        overridden by cache).
         """
         try:
             status, resp = self.api.call(
@@ -235,6 +302,7 @@ class GateAgent:
             log.error("server unreachable: %r", e)
             return "server_unreachable", {}
         if status >= 500:
+            log.error("server error: HTTP %s", status)
             return "server_unreachable", {}
         if status != 200 or not isinstance(resp, dict):
             return f"api_error_{status}", resp if isinstance(resp, dict) else {}
@@ -242,6 +310,19 @@ class GateAgent:
         if decision == "rejected":
             return resp.get("reason", "rejected"), resp
         return decision, resp
+
+    def validate_offline(self, token, direction):
+        """Decide without the server (guide "SKENARIO GANGGUAN").
+
+        Entry: token must be in the cached list and inside its slot.
+        Exit: token must have entered through this Pi.
+        """
+        if direction == "exit":
+            if self.used.has("entry", token):
+                return "allowed", {"reason": "offline_exit"}
+            return "offline_not_entered", {}
+        code = self.cache.check(token)
+        return code, {"reason": "offline_cache"} if code == "allowed" else {}
 
     def cancel(self, event_id, reason):
         try:
@@ -309,6 +390,15 @@ def run_gate(agent, gate):
             log.exception("[%s] scan handling crashed", gate["direction"])
 
 
+def run_sync(agent, every_s):
+    while True:
+        try:
+            agent.sync()
+        except Exception:
+            log.exception("sync crashed")
+        time.sleep(every_s)
+
+
 # Main ----------------------------------------------------------------------
 
 def main(argv=None):
@@ -336,10 +426,13 @@ def main(argv=None):
     api = Client(cfg, verbose=a.verbose)
     opener = DryRunOpener() if a.dry_run else RelayOpener(
         agent_cfg["relay_port"], agent_cfg["relay_driver_dir"])
-    reporter = Reporter(api, state / "pending_reports.jsonl")
-    agent = GateAgent(api, opener, UsedTokens(state / "used_tokens.json"),
-                      reporter)
-    reporter.flush()
+    agent = GateAgent(api, opener,
+                      UsedTokens(state / "used_tokens.json"),
+                      Reporter(api, state / "pending_reports.jsonl"),
+                      QrCache(state / "qr_cache.json"))
+
+    threading.Thread(target=run_sync, daemon=True, args=(
+        agent, agent_cfg.get("sync_interval_s", 300))).start()
 
     if a.stdin:
         gate = gates[a.gate]

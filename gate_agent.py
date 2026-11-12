@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gate_client import Client, now, token_of
@@ -39,6 +39,7 @@ class Result:
     opened: bool
     code: str
     response: dict = field(default_factory=dict)
+    token: str = ""
 
 
 def parse_ts(value):
@@ -46,9 +47,30 @@ def parse_ts(value):
 
 
 def write_atomic(path: Path, text: str):
+    """Replace path so a power cut leaves either the old or new file."""
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
+    with tmp.open("w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def load_json(path: Path, default):
+    """Read a state file. A corrupt one is set aside, not fatal.
+
+    Crashing here would make systemd restart the agent forever and keep
+    the barrier shut, so the agent starts with `default` instead.
+    """
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        bad = path.with_suffix(path.suffix + ".corrupt")
+        log.error("%s unreadable (%s), moved to %s", path, e, bad.name)
+        os.replace(path, bad)
+        return default
 
 
 # Local state -------------------------------------------------------------
@@ -61,11 +83,13 @@ class UsedTokens:
     lets an exit open offline (guide "SKENARIO GANGGUAN").
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, keep_days=7):
         self.path = path
-        data = json.loads(path.read_text()) if path.exists() else {}
+        self.keep = timedelta(days=keep_days)
+        data = load_json(path, {})
         self._used = {"entry": data.get("entry", {}),
                       "exit": data.get("exit", {})}
+        self._prune()
 
     def has(self, direction, token):
         return token in self._used[direction]
@@ -78,8 +102,16 @@ class UsedTokens:
         if self._used[direction].pop(token, None):
             self._save()
 
+    def _prune(self):
+        """Forget tokens older than keep_days. An old entry record no
+        longer lets that vehicle exit offline; online exit is unaffected."""
+        cutoff = datetime.now(timezone.utc) - self.keep
+        for d in self._used:
+            self._used[d] = {t: at for t, at in self._used[d].items()
+                             if parse_ts(at) >= cutoff}
+
     def _save(self):
-        # ponytail: grows forever, prune old entries if the file gets big
+        self._prune()
         write_atomic(self.path, json.dumps(self._used, indent=1))
 
 
@@ -92,7 +124,7 @@ class QrCache:
 
     def __init__(self, path: Path):
         self.path = path
-        self.data = json.loads(path.read_text()) if path.exists() else {}
+        self.data = load_json(path, {})
 
     def refresh(self, api: Client):
         """Pull a fresh list. Returns True on success; keeps the old list
@@ -142,6 +174,8 @@ class Reporter:
             log.warning("report %s queued for retry", body["event_id"])
             with self.path.open("a") as f:
                 f.write(json.dumps(body) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
 
     def _post(self, body):
         """Return True when the report needs no retry."""
@@ -164,8 +198,14 @@ class Reporter:
         """Resend queued reports in one batch (max 200, guide section 5)."""
         if not self.path.exists():
             return
-        queued = [json.loads(x) for x in self.path.read_text().splitlines()
-                  if x.strip()]
+        queued = []
+        for line in self.path.read_text().splitlines():
+            try:
+                queued.append(json.loads(line))
+            except ValueError:
+                # a power cut mid-append leaves a partial last line
+                if line.strip():
+                    log.error("dropping unreadable queued report: %r", line)
         if not queued:
             return
         try:
@@ -247,6 +287,7 @@ class GateAgent:
     def handle_scan(self, gate, value):
         with self._lock:
             result = self._handle(gate, value)
+            result.token = token_of(value.strip())
             self.on_result(gate, result)
         return result
 
@@ -332,9 +373,12 @@ class GateAgent:
             log.error("cancel %s failed: %r", event_id, e)
 
     def on_result(self, gate, result):
+        # 8 chars identify the QR in logs without exposing the full token
         level = logging.INFO if result.opened else logging.WARNING
-        log.log(level, "[%s] %s: %s", gate["direction"],
-                "OPEN" if result.opened else "DENY", result.code)
+        log.log(level, "[%s] %s: %s qr=%s %s", gate["direction"],
+                "OPEN" if result.opened else "DENY", result.code,
+                result.token[:8] or "-",
+                result.response.get("tracking_code", ""))
 
 
 # Scanner -----------------------------------------------------------------
@@ -427,7 +471,8 @@ def main(argv=None):
     opener = DryRunOpener() if a.dry_run else RelayOpener(
         agent_cfg["relay_port"], agent_cfg["relay_driver_dir"])
     agent = GateAgent(api, opener,
-                      UsedTokens(state / "used_tokens.json"),
+                      UsedTokens(state / "used_tokens.json",
+                                 agent_cfg.get("used_token_days", 7)),
                       Reporter(api, state / "pending_reports.jsonl"),
                       QrCache(state / "qr_cache.json"))
 

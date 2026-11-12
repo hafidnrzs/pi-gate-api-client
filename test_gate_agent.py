@@ -172,7 +172,34 @@ def test_offline():
         assert not agent.used.has("entry", "x")
 
 
+def test_state_files():
+    with tempfile.TemporaryDirectory() as d:
+        # power cut left empty or half-written files: start, do not crash
+        used, cache = Path(d) / "used.json", Path(d) / "cache.json"
+        used.write_text("")
+        cache.write_text('{"entries": [')
+        agent, _ = make(d, FakeApi())
+        assert (Path(d) / "used.json.corrupt").exists()
+        assert agent.handle_scan(ENTRY, "tok").opened
+        # partial last line in the retry queue is skipped, rest is sent
+        pending = Path(d) / "pending.jsonl"
+        pending.write_text('{"event_id": "a"}\n{"event_id": "b')
+        agent.api.answers["/events/batch"] = (200, {"results": [
+            {"event_id": "a", "ok": True}]})
+        agent.reporter.flush()
+        assert pending.read_text() == ""
+
+    with tempfile.TemporaryDirectory() as d:
+        # tokens older than keep_days are forgotten on load and on save
+        path = Path(d) / "used.json"
+        path.write_text('{"entry": {"old": "%s", "new": "%s"}}'
+                        % (ts(-8 * 24 * 60), ts(-60)))
+        used = UsedTokens(path, keep_days=7)
+        assert not used.has("entry", "old") and used.has("entry", "new")
+
+
 if __name__ == "__main__":
+    test_state_files()
     test_online()
     test_relay_outcomes()
     test_offline()

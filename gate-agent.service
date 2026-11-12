@@ -1,0 +1,17 @@
+# Gate agent on boot. Install steps: README "Running as a service".
+[Unit]
+Description=Industrial estate gate agent (QR scanner to barrier relay)
+After=network.target
+# Never stop retrying, a stopped agent means a closed barrier.
+StartLimitIntervalSec=0
+
+[Service]
+# Change User and both paths to match the Pi.
+User=pi
+WorkingDirectory=/home/pi/Project/pi-gate-api-client
+ExecStart=/usr/bin/python3 /home/pi/Project/pi-gate-api-client/gate_agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

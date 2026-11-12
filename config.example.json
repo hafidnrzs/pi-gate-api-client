@@ -9,6 +9,7 @@
     "relay_driver_dir": "~/Project/esp32c3-relay/pi",
     "state_dir": "state",
     "sync_interval_s": 300,
+    "used_token_days": 7,
     "gates": [
       {
         "direction": "entry",

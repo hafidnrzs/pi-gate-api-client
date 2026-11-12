@@ -295,6 +295,7 @@ The agent reads the `agent` section of the same `config.json`:
 | `relay_driver_dir` | Folder holding `test_relay.py` from `esp32c3-relay/pi`  |
 | `state_dir`        | Runtime state, relative to this folder (default `state`) |
 | `sync_interval_s`  | Cache pull and report retry interval (default 300)      |
+| `used_token_days`  | Days a used token is remembered (default 7). Also how long after entry an offline exit still works |
 | `gates[]`          | One entry per scanner/barrier pair                      |
 | `gates[].direction`| `entry` or `exit`                                       |
 | `gates[].scanner`  | Scanner input device. Find it with `ls /dev/input/by-id/` |
@@ -369,6 +370,108 @@ server.
 
 To start over during testing, stop the agent and delete `state/`.
 
+### Running as a service
+
+`gate-agent.service` starts the agent on boot and restarts it 5 s after
+any crash, forever.
+
+1. Find the three values for `gate-agent.service`. Log in to the Pi over
+   SSH as the user that normally runs the agent (the one that ran
+   `python3 gate_agent.py` successfully), then go to this repo's folder:
+
+   ```bash
+   cd ~/Project/pi-gate-api-client   # or wherever this repo was cloned
+   whoami                            # -> value for User
+   pwd                               # -> value for WorkingDirectory
+   which python3                     # -> Python path for ExecStart
+   ```
+
+   Example output, for user `pi`:
+
+   ```
+   pi
+   /home/pi/Project/pi-gate-api-client
+   /usr/bin/python3
+   ```
+
+   If you do not know where the repo is, search for it:
+   `find ~ -name gate_agent.py`. The folder that holds the file is the
+   `WorkingDirectory`.
+
+   Also check that this user has the `input` and `dialout` groups (step 2
+   above). Both names must appear in the output of:
+
+   ```bash
+   groups
+   ```
+
+   If you ran the agent with a virtualenv activated (the prompt starts
+   with `(.venv)`), `which python3` prints the venv's Python, for example
+   `/home/pi/Project/esp32c3-relay/.venv/bin/python3`. Use that path, since
+   the libraries are installed there. Otherwise it prints
+   `/usr/bin/python3`.
+
+2. Put the values into `gate-agent.service`. `ExecStart` is the Python
+   path, a space, then the full path to `gate_agent.py` (the
+   `WorkingDirectory` plus `/gate_agent.py`). With the example output
+   above:
+
+   ```ini
+   User=pi
+   WorkingDirectory=/home/pi/Project/pi-gate-api-client
+   ExecStart=/usr/bin/python3 /home/pi/Project/pi-gate-api-client/gate_agent.py
+   ```
+
+   Edit the file on the Pi with `nano gate-agent.service`, save with
+   Ctrl+O then Enter, and exit with Ctrl+X. Do not use `~` in these
+   lines: systemd does not expand it, so write the full `/home/...` path.
+
+   Before installing, test the exact `ExecStart` line by hand. It must
+   start without errors (stop it with Ctrl+C):
+
+   ```bash
+   /usr/bin/python3 /home/pi/Project/pi-gate-api-client/gate_agent.py --dry-run
+   ```
+
+3. Install and start it:
+
+   ```bash
+   sudo cp gate-agent.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now gate-agent
+   ```
+
+4. Keep logs across reboots, capped at 50 MB so the SD card is not filled:
+
+   ```bash
+   sudo mkdir -p /etc/systemd/journald.conf.d
+   printf '[Journal]\nStorage=persistent\nSystemMaxUse=50M\n' \
+     | sudo tee /etc/systemd/journald.conf.d/gate.conf
+   sudo systemctl restart systemd-journald
+   ```
+
+Daily use:
+
+| Task                          | Command                                         |
+|-------------------------------|-------------------------------------------------|
+| Status and last log lines     | `systemctl status gate-agent`                   |
+| Follow the log live           | `journalctl -u gate-agent -f`                   |
+| Log of one period             | `journalctl -u gate-agent --since "2026-11-12 14:00" --until "2026-11-12 16:00"` |
+| Problems only                 | `journalctl -u gate-agent -p warning`           |
+| Find one QR or delivery       | `journalctl -u gate-agent \| grep KITB-20261112-DD6F3D` |
+| Restart after editing config  | `sudo systemctl restart gate-agent`             |
+| Stop for manual testing       | `sudo systemctl stop gate-agent`                |
+
+Each scan logs one line, for example
+`[entry] OPEN: sesuai_jadwal qr=Xk2D8nF0 KITB-20261112-DD6F3D`. `qr=` is
+the first 8 characters of the token. The `KITB-...` tracking code is the
+one shown on the web dashboard; the server sends it only for allowed and
+payment-required scans, so rejected scans are matched by `qr=` and time.
+
+State files are written with fsync. If a power cut still leaves one
+unreadable, the agent logs `unreadable`, moves it to `*.corrupt` and
+starts with an empty one instead of crashing.
+
 ### Extending
 
 Each concern lives in one place in `gate_agent.py`:
@@ -381,6 +484,5 @@ Each concern lives in one place in `gate_agent.py`:
 | Heartbeat every minute (guide section 6) | new thread in `main()` calling `/heartbeat` with relay health |
 | Another barrier driver              | new class with `open(gate)` returning `opened`/`failed`/`unknown` |
 | Another scanner type                | new generator like `evdev_scans()` yielding scan strings |
-| Run on boot                         | systemd unit running `python3 gate_agent.py` |
 
 Add a case to `test_gate_agent.py` for each new decision path.

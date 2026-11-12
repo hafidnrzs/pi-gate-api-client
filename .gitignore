@@ -2,6 +2,7 @@
 config.json
 pc-api-*.json
 api-contract/
+state/
 
 __pycache__/
 .venv/

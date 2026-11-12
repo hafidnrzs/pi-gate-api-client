@@ -1,11 +1,11 @@
 # pi-gate-api-client
 
-Test tooling for integrating an estate gate (Raspberry Pi) with the QR
-validation web server run by the estate web owner.
+Raspberry Pi software for an estate gate: a QR scan is validated against
+the estate web server and, if allowed, the barrier opens.
 
 The web server owner provides the API contract (`api-contract/`, kept out
 of Git: get it privately from the project team). This repo
-holds two small tools built from that contract:
+holds three small tools built from that contract:
 
 - **`mock_server.py`**: a FastAPI mock of the API. Returns canned responses
   with the same shape as the real server, so the gate side can be tested
@@ -13,9 +13,9 @@ holds two small tools built from that contract:
 - **`gate_client.py`**: a single-file CLI that runs on the Raspberry Pi and
   sends requests to either the mock or the real server. Python standard
   library only, so nothing needs to be installed on the Pi.
-
-The client does **not** drive the gate relay. It only exercises the HTTP
-API. Opening the barrier is handled separately by `esp32c3-relay`.
+- **`gate_agent.py`**: the gate service. Reads the QR scanner, validates
+  the scan with the server, opens the barrier through the `esp32c3-relay`
+  driver, and reports back. See [Gate agent](#gate-agent).
 
 ## Folder structure
 
@@ -26,14 +26,16 @@ pi-gate-api-client/
 │   ├── pc-qr-openapi.json           # OpenAPI 3.0.3 spec
 │   └── pc-qr-postman-collection.json
 ├── mock_server.py                   # FastAPI mock of the API
-├── gate_client.py                   # CLI for the Raspberry Pi
+├── gate_client.py                   # API client + manual test CLI
+├── gate_agent.py                    # scan -> validate -> open -> report
+├── test_gate_agent.py               # self-check for gate_agent decisions
 ├── config.example.json              # template for config.json
 ├── requirements.txt                 # mock server dependencies only
 └── README.md
 ```
 
-`config.json`, `pc-api-*.json` (issued key files) and `api-contract/` are
-ignored by Git. Never commit them.
+`config.json`, `pc-api-*.json` (issued key files), `api-contract/` and the
+agent's runtime `state/` are ignored by Git. Never commit them.
 
 ## Configuration
 
@@ -168,9 +170,9 @@ the Pi.
 token. `batch` takes a JSON file holding a list of gate reports (same body
 as `/events`). Run `python3 gate_client.py <command> -h` for details.
 
-## Verifying it works
+## Verifying the client
 
-There is no physical sign: the client never touches the relay, so the
+There is no physical sign: `gate_client.py` never touches the relay, so the
 barrier does not move. Success is shown in three places.
 
 1. **Client output.** Each request prints `>>>` (what was sent) and `<<<`
@@ -210,3 +212,128 @@ barrier does not move. Success is shown in three places.
 | `HTTP 403` `IP_NOT_ALLOWED`         | Real server: request is not from the whitelisted public IP |
 | `HTTP 404` `ESTATE_NOT_FOUND`       | Wrong `estate_id`                       |
 | `clock_ok: false` in heartbeat      | Pi clock is off by more than 60 s. Check NTP: `timedatectl` |
+
+## Gate agent
+
+`gate_agent.py` is the service that runs the gate unattended.
+
+### Flow
+
+```
+scanner ──scan──> gate_agent ──POST /validate──> server
+                      │
+          token already used locally? ──yes──> DENY used_locally
+                      │
+          decision != allowed ──────────────> DENY <reason>
+                      │ allowed
+          mark token used (state/used_tokens.json)
+                      │
+          pulse relay ── failed ──> POST /cancel, unmark, DENY gate_failed
+                      │   unknown ─> keep token used, DENY gate_unknown
+                      │ opened
+          POST /events (queued to state/pending_reports.jsonl on failure)
+                      │
+                   OPEN
+```
+
+| Result code          | Meaning                                                 |
+|----------------------|---------------------------------------------------------|
+| `sesuai_jadwal`, `boleh_keluar` | Barrier opened, report sent or queued        |
+| `used_locally`       | Token already opened the barrier on this Pi (guide section 2 requires this check) |
+| server reasons       | e.g. `qr_tidak_terdaftar`, `qr_sudah_masuk`, `di_luar_jadwal`: barrier stays shut |
+| `payment_required`   | Late exit, payment needed. Not handled yet, barrier stays shut |
+| `server_unreachable` | Network error or HTTP 5xx. Barrier stays shut (no cache yet) |
+| `api_error_<status>` | 401/403/404: wrong key, IP or estate ID in `config.json` |
+| `gate_failed`        | Relay surely did not fire (ESP32 offline or refused). Permit cancelled, token can be scanned again |
+| `gate_unknown`       | Relay accepted the pulse but never confirmed. Token kept as used, no report sent |
+
+Queued reports are resent with `/events/batch` at startup and after every
+scan, reusing the same `event_id` so the server counts each once.
+
+### Configuration
+
+The agent reads the `agent` section of the same `config.json`:
+
+| Field              | Meaning                                                 |
+|--------------------|---------------------------------------------------------|
+| `relay_port`       | ESP32-C3 serial port, e.g. `/dev/ttyACM0` (a `/dev/serial/by-id/...` path survives re-plugging) |
+| `relay_driver_dir` | Folder holding `test_relay.py` from `esp32c3-relay/pi`  |
+| `state_dir`        | Runtime state, relative to this folder (default `state`) |
+| `gates[]`          | One entry per scanner/barrier pair                      |
+| `gates[].direction`| `entry` or `exit`                                       |
+| `gates[].scanner`  | Scanner input device. Find it with `ls /dev/input/by-id/` |
+| `gates[].relay`    | Relay number on the ESP32-C3 (1 = GPIO6, 2 = GPIO7)     |
+| `gates[].pulse_ms` | Relay pulse length, 1 to 5000 ms                        |
+
+### Running on the Pi
+
+Both repos are expected side by side, e.g. `~/Project/esp32c3-relay` and
+`~/Project/pi-gate-api-client`.
+
+1. Install the two hardware libraries (the API part needs nothing):
+
+   ```bash
+   sudo apt install python3-evdev python3-serial
+   ```
+
+   Or inside the existing `esp32c3-relay/.venv`: `pip install evdev`
+   (pyserial is already there).
+
+2. Allow the user to read the scanner and the serial port without sudo,
+   then log out and back in:
+
+   ```bash
+   sudo usermod -aG input,dialout $USER
+   ```
+
+3. Run the self-check, then go step by step:
+
+   ```bash
+   python3 test_gate_agent.py
+   python3 gate_agent.py --stdin --dry-run    # type scans, no hardware
+   python3 gate_agent.py --dry-run            # real scanner, no relay
+   python3 gate_agent.py                      # full: scanner + relay
+   ```
+
+   Add `-v` to print every API request and response. Stop with Ctrl+C.
+
+### Verifying the agent
+
+Test with the mock first (`base_url` pointing at it), then with the real
+server.
+
+1. **`--stdin --dry-run`**: type `abc` and press Enter. The log shows
+   `[dry-run] would pulse relay 1` then `OPEN: sesuai_jadwal`. Type `abc`
+   again: `DENY: used_locally`. Type `reject-1`: `DENY: qr_tidak_terdaftar`.
+   The mock log shows `/validate` and `/events` calls.
+2. **`--dry-run` with the scanner**: the log shows `scanner ready`. Scan a
+   QR code: one `OPEN` or `DENY` line per scan. Nothing is typed into the
+   Pi console (the agent grabs the scanner).
+3. **Full run**: scan an allowed QR code.
+   - **Physical**: the relay clicks, the relay module LED (if fitted) lights for
+     `pulse_ms`, and the barrier opens.
+   - **Log**: `OPEN: sesuai_jadwal`, with no `queued for retry` warning.
+   - **Server**: on the real server the delivery moves to "inside" in
+     *Admin web > Validasi QR Gerbang*.
+
+   Scan a rejected QR code: no click, `DENY` with the reason.
+4. **Failure checks**: unplug the ESP32-C3 and scan, which should give
+   `DENY: gate_failed`. Stop the mock and scan: `DENY: server_unreachable`.
+
+To start over during testing, stop the agent and delete `state/`.
+
+### Extending
+
+Each concern lives in one place in `gate_agent.py`:
+
+| Requirement                         | Where                                        |
+|-------------------------------------|----------------------------------------------|
+| Offline cache (guide section 1)     | `GateAgent.validate()`: on `server_unreachable`, decide from a cached `entries?include_upcoming=1` list |
+| Buzzer, LED, display feedback       | `GateAgent.on_result()`                       |
+| Exit payment (`payment_required`)   | `GateAgent._handle()`, after `validate()`     |
+| Heartbeat every minute (guide section 6) | new thread in `main()` calling `/heartbeat` with relay health |
+| Another barrier driver              | new class with `open(gate)` returning `opened`/`failed`/`unknown` |
+| Another scanner type                | new generator like `evdev_scans()` yielding scan strings |
+| Run on boot                         | systemd unit running `python3 gate_agent.py` |
+
+Add a case to `test_gate_agent.py` for each new decision path.

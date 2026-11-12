@@ -29,7 +29,8 @@ def now() -> str:
 
 
 class Client:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, verbose: bool = True):
+        self.verbose = verbose
         base_url = cfg["base_url"].rstrip("/")
         self.base = f"{base_url}/api/pc-qr/{cfg['estate_id']}"
         self.key = cfg["api_key"]
@@ -37,16 +38,18 @@ class Client:
         self.timeout = cfg.get("timeout_s", 5)
 
     def call(self, method, path, body=None, data=None, headers=None):
-        """Send one request, print it, and return (status, parsed JSON)."""
+        """Send one request and return (status, parsed JSON).
+
+        Prints request and response when verbose. Network failures raise
+        OSError (URLError or timeout) for the caller to handle.
+        """
         h = {"X-API-Key": self.key, **(headers or {})}
         if body is not None:
             data = json.dumps(body).encode()
             h["Content-Type"] = "application/json"
         req = urllib.request.Request(self.base + path, data=data,
                                      headers=h, method=method)
-        print(f">>> {method} {self.base + path}")
-        if body is not None:
-            print(json.dumps(body, indent=2))
+        self._show(f">>> {method} {self.base + path}", body)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 status, raw = r.status, r.read()
@@ -56,9 +59,14 @@ class Client:
             resp = json.loads(raw)
         except ValueError:
             resp = raw.decode(errors="replace")
-        print(f"<<< HTTP {status}")
-        print(json.dumps(resp, indent=2, ensure_ascii=False))
+        self._show(f"<<< HTTP {status}", resp)
         return status, resp
+
+    def _show(self, line, payload=None):
+        if self.verbose:
+            print(line)
+            if payload is not None:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
 
     def event_body(self, token, direction, event_id=None, authorized_at=None):
         return {
@@ -168,8 +176,8 @@ def main(argv=None):
                                headers={"Content-Type": "image/jpeg",
                                         "X-QR-Token": a.token,
                                         "X-Gate-Direction": direction})
-    except urllib.error.URLError as e:
-        sys.exit(f"Connection failed: {e.reason}")
+    except (urllib.error.URLError, TimeoutError) as e:
+        sys.exit(f"Connection failed: {getattr(e, 'reason', e)}")
     return 0 if 200 <= status < 300 else 1
 
 

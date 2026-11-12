@@ -3,5 +3,18 @@
   "estate_id": 1,
   "estate_code": "DEMO",
   "api_key": "dev-key",
-  "timeout_s": 5
+  "timeout_s": 5,
+  "agent": {
+    "relay_port": "/dev/ttyACM0",
+    "relay_driver_dir": "~/Project/esp32c3-relay/pi",
+    "state_dir": "state",
+    "gates": [
+      {
+        "direction": "entry",
+        "scanner": "/dev/input/by-id/usb-BF_SCAN_SCAN_KEYBOARD_A-00000-event-kbd",
+        "relay": 1,
+        "pulse_ms": 1000
+      }
+    ]
+  }
 }

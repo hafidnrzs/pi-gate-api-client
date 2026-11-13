@@ -4,7 +4,7 @@
 Runs on the Pi and wires three parts together:
   scanner  USB keyboard-wedge QR reader, read with evdev
   server   PC QR API, through gate_client.Client
-  barrier  ESP32-C3 relay, through esp32c3-relay's RelayClient
+  barrier  ESP32-C3 relay, through relay.RelayClient
 
 When the server is unreachable, entry scans fall back to a QR list cached
 by periodic sync. Rules follow api-contract/pc-qr-api-guide.txt sections 1
@@ -266,9 +266,8 @@ class RelayOpener:
     "unknown" (it may have fired, so the token stays marked as used).
     """
 
-    def __init__(self, port, driver_dir, on_port_change=None):
-        sys.path.insert(0, str(Path(driver_dir).expanduser()))
-        from test_relay import RelayClient, RelayError  # esp32c3-relay/pi
+    def __init__(self, port, on_port_change=None):
+        from relay import RelayClient, RelayError  # lazy: needs pyserial
         self._client_cls = RelayClient
         self._relay_error = RelayError
         self._on_port_change = on_port_change or (lambda port: None)
@@ -557,8 +556,7 @@ def main(argv=None):
         log.info("relay_port saved to %s", a.config)
 
     opener = DryRunOpener() if a.dry_run else RelayOpener(
-        agent_cfg["relay_port"], agent_cfg["relay_driver_dir"],
-        save_relay_port)
+        agent_cfg["relay_port"], save_relay_port)
     agent = GateAgent(api, opener,
                       UsedTokens(state / "used_tokens.json",
                                  agent_cfg.get("used_token_days", 7)),

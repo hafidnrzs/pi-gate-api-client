@@ -6,7 +6,6 @@
   "timeout_s": 5,
   "agent": {
     "relay_port": "/dev/ttyACM0",
-    "relay_driver_dir": "~/Project/esp32c3-relay/pi",
     "state_dir": "state",
     "sync_interval_s": 60,
     "used_token_days": 7,

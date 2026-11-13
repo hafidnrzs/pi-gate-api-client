@@ -14,8 +14,8 @@ holds three small tools built from that contract:
   sends requests to either the mock or the real server. Python standard
   library only, so nothing needs to be installed on the Pi.
 - **`gate_agent.py`**: the gate service. Reads the QR scanner, validates
-  the scan with the server, opens the barrier through the `esp32c3-relay`
-  driver, and reports back. See [Gate agent](#gate-agent).
+  the scan with the server, opens the barrier through the ESP32-C3
+  relay (`relay.py`), and reports back. See [Gate agent](#gate-agent).
 
 ## Folder structure
 
@@ -28,6 +28,7 @@ pi-gate-api-client/
 ├── mock_server.py                   # FastAPI mock of the API
 ├── gate_client.py                   # API client + manual test CLI
 ├── gate_agent.py                    # scan -> validate -> open -> report
+├── relay.py                         # ESP32-C3 relay client + test CLI
 ├── test_gate_agent.py               # self-check for gate_agent decisions
 ├── config.example.json              # template for config.json
 ├── requirements.txt                 # mock server dependencies only
@@ -304,7 +305,6 @@ The agent reads the `agent` section of the same `config.json`:
 | Field              | Meaning                                                 |
 |--------------------|---------------------------------------------------------|
 | `relay_port`       | ESP32-C3 serial port, e.g. `/dev/ttyACM0`. Found automatically: if it does not answer a ping (at start, or when a scan finds the relay silent), the agent pings every `/dev/serial/by-id/*`, `/dev/ttyACM*` and `/dev/ttyUSB*` port, uses the first that answers, and writes it back here. Look for `relay moved` in the log |
-| `relay_driver_dir` | Folder holding `test_relay.py` from `esp32c3-relay/pi`  |
 | `state_dir`        | Runtime state, relative to this folder (default `state`) |
 | `sync_interval_s`  | Cache pull and report retry interval (default 60)       |
 | `used_token_days`  | Days a used token is remembered (default 7). Also how long after entry an offline exit still works |
@@ -316,8 +316,10 @@ The agent reads the `agent` section of the same `config.json`:
 
 ### Running on the Pi
 
-Both repos are expected side by side, e.g. `~/Project/esp32c3-relay` and
-`~/Project/pi-gate-api-client`.
+Everything the agent needs is in this folder; the `esp32c3-relay` repo is
+not required. Test the relay alone with `python3 relay.py ping` or
+`python3 relay.py pulse 1 1000` (stop the service first, the port is
+opened exclusively).
 
 1. Install the two hardware libraries (the API part needs nothing):
 
@@ -325,8 +327,7 @@ Both repos are expected side by side, e.g. `~/Project/esp32c3-relay` and
    sudo apt install python3-evdev python3-serial
    ```
 
-   Or inside the existing `esp32c3-relay/.venv`: `pip install evdev`
-   (pyserial is already there).
+   Or in a venv: `pip install evdev pyserial`.
 
 2. Allow the user to read the scanner and the serial port without sudo,
    then log out and back in:
@@ -419,7 +420,7 @@ any crash, forever.
 
    If you ran the agent with a virtualenv activated (the prompt starts
    with `(.venv)`), `which python3` prints the venv's Python, for example
-   `/home/pi/Project/esp32c3-relay/.venv/bin/python3`. Use that path, since
+   `/home/pi/Project/pi-gate-api-client/.venv/bin/python3`. Use that path, since
    the libraries are installed there. Otherwise it prints
    `/usr/bin/python3`.
 

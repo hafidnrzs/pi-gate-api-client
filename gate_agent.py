@@ -24,6 +24,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from glob import glob
 from pathlib import Path
 
 from gate_client import Client, now, token_of
@@ -226,6 +227,38 @@ class Reporter:
 
 # Barrier -----------------------------------------------------------------
 
+RELAY_PORT_GLOBS = ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*")
+
+
+def find_relay(client_cls, preferred, candidates=None, tries=3):
+    """Return the first serial port whose device answers a ping, or None.
+
+    `preferred` is tried first. by-id paths come before ttyACM/ttyUSB so
+    the saved port is the stable name, and a port reached twice through a
+    symlink is probed once.
+    """
+    if candidates is None:
+        candidates = [p for g in RELAY_PORT_GLOBS for p in sorted(glob(g))]
+    seen = set()
+    for port in [preferred, *candidates]:
+        real = os.path.realpath(port)
+        if real in seen or not os.path.exists(real):
+            continue
+        seen.add(real)
+        client = client_cls(port, ping_interval=0).start()
+        try:
+            for _ in range(tries):
+                try:
+                    client.ping()
+                    log.info("relay found on %s", port)
+                    return port
+                except Exception:
+                    time.sleep(0.3)  # board may still be booting after open
+        finally:
+            client.close()
+    return None
+
+
 class RelayOpener:
     """Opens a barrier by pulsing its relay on the ESP32-C3.
 
@@ -233,18 +266,40 @@ class RelayOpener:
     "unknown" (it may have fired, so the token stays marked as used).
     """
 
-    def __init__(self, port, driver_dir):
+    def __init__(self, port, driver_dir, on_port_change=None):
         sys.path.insert(0, str(Path(driver_dir).expanduser()))
         from test_relay import RelayClient, RelayError  # esp32c3-relay/pi
+        self._client_cls = RelayClient
         self._relay_error = RelayError
-        self.relay = RelayClient(port, ping_interval=0).start()
+        self._on_port_change = on_port_change or (lambda port: None)
+        self.port = port
+        self.relay = None
+        self._connect()
+
+    def _connect(self):
+        """Use the first port that answers a ping, the configured one first."""
+        if self.relay:
+            self.relay.close()  # free the port before probing it again
+        found = find_relay(self._client_cls, self.port)
+        if found and found != self.port:
+            log.warning("relay moved: %s -> %s", self.port, found)
+            self.port = found
+            self._on_port_change(found)
+        elif not found:
+            log.error("no relay answered a ping, keeping %s", self.port)
+        self.relay = self._client_cls(self.port, ping_interval=0).start()
 
     def open(self, gate):
         try:
             self.relay.ping()
         except Exception as e:
-            log.error("relay not responding: %r", e)
-            return "failed"
+            log.error("relay not responding: %r, searching ports", e)
+            self._connect()
+            try:
+                self.relay.ping()
+            except Exception as e:
+                log.error("relay not responding: %r", e)
+                return "failed"
         try:
             self.relay.pulse(gate["relay"], gate.get("pulse_ms", 1000))
             return "opened"
@@ -495,8 +550,15 @@ def main(argv=None):
     state = HERE / agent_cfg.get("state_dir", "state")
     state.mkdir(parents=True, exist_ok=True)
     api = Client(cfg, verbose=a.verbose)
+
+    def save_relay_port(port):
+        agent_cfg["relay_port"] = port
+        write_atomic(a.config, json.dumps(cfg, indent=2) + "\n")
+        log.info("relay_port saved to %s", a.config)
+
     opener = DryRunOpener() if a.dry_run else RelayOpener(
-        agent_cfg["relay_port"], agent_cfg["relay_driver_dir"])
+        agent_cfg["relay_port"], agent_cfg["relay_driver_dir"],
+        save_relay_port)
     agent = GateAgent(api, opener,
                       UsedTokens(state / "used_tokens.json",
                                  agent_cfg.get("used_token_days", 7)),

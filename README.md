@@ -303,7 +303,7 @@ The agent reads the `agent` section of the same `config.json`:
 
 | Field              | Meaning                                                 |
 |--------------------|---------------------------------------------------------|
-| `relay_port`       | ESP32-C3 serial port, e.g. `/dev/ttyACM0` (a `/dev/serial/by-id/...` path survives re-plugging) |
+| `relay_port`       | ESP32-C3 serial port, e.g. `/dev/ttyACM0`. Found automatically: if it does not answer a ping (at start, or when a scan finds the relay silent), the agent pings every `/dev/serial/by-id/*`, `/dev/ttyACM*` and `/dev/ttyUSB*` port, uses the first that answers, and writes it back here. Look for `relay moved` in the log |
 | `relay_driver_dir` | Folder holding `test_relay.py` from `esp32c3-relay/pi`  |
 | `state_dir`        | Runtime state, relative to this folder (default `state`) |
 | `sync_interval_s`  | Cache pull and report retry interval (default 60)       |

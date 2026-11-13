@@ -1,10 +1,12 @@
 """Self-check for gate_agent decisions. Run: python3 test_gate_agent.py"""
 
+import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from gate_agent import GateAgent, QrCache, Reporter, UsedTokens
+from gate_agent import (GateAgent, QrCache, Reporter, UsedTokens,
+                        find_relay)
 
 ENTRY = {"direction": "entry", "relay": 1}
 EXIT = {"direction": "exit", "relay": 2}
@@ -215,9 +217,48 @@ def test_state_files():
         assert not used.has("entry", "old") and used.has("entry", "new")
 
 
+def test_find_relay():
+    with tempfile.TemporaryDirectory() as d:
+        acm0, acm1 = Path(d) / "ttyACM0", Path(d) / "ttyACM1"
+        acm0.touch(), acm1.touch()
+        by_id = Path(d) / "usb-Espressif-if00"
+        by_id.symlink_to(acm1)
+        probed = []
+
+        class FakeRelay:
+            def __init__(self, port, ping_interval):
+                self.port = port
+
+            def start(self):
+                probed.append(self.port)
+                return self
+
+            def ping(self):
+                if os.path.realpath(self.port) != str(acm1):
+                    raise TimeoutError("no pong")
+
+            def close(self):
+                pass
+
+        ports = [str(by_id), str(acm0), str(acm1)]
+        # configured port answers: kept, nothing else probed
+        assert find_relay(FakeRelay, str(acm1), ports, tries=1) == str(acm1)
+        assert probed == [str(acm1)]
+        # configured port moved or gone: stable by-id name found
+        probed.clear()
+        assert find_relay(FakeRelay, "/dev/gone", ports, tries=1) == str(by_id)
+        # acm1 is the same device as by-id, so it is not probed twice
+        probed.clear()
+        assert find_relay(FakeRelay, str(acm0), ports, tries=1) == str(by_id)
+        assert probed == [str(acm0), str(by_id)], probed
+        # nothing answers
+        assert find_relay(FakeRelay, str(acm0), [str(acm0)], tries=1) is None
+
+
 if __name__ == "__main__":
     test_state_files()
     test_online()
     test_relay_outcomes()
     test_offline()
+    test_find_relay()
     print("all checks passed")

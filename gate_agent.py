@@ -118,8 +118,9 @@ class UsedTokens:
 class QrCache:
     """Last QR list from GET /entries?include_upcoming=1 (guide section 1).
 
-    Only consulted when the server is unreachable. A QR registered after
-    the last sync is not in the list, so it is rejected.
+    Entry scans are decided from this list first; the server is asked only
+    for a QR not in it. If the server is then unreachable, the QR is
+    rejected (e.g. registered after the last sync).
     """
 
     def __init__(self, path: Path):
@@ -154,9 +155,9 @@ class QrCache:
             if e.get("qr_token") != token:
                 continue
             if e.get("valid_from") and at < parse_ts(e["valid_from"]):
-                return "offline_too_early"
+                return "slot_too_early"
             if at >= parse_ts(e["valid_until"]):
-                return "offline_too_late"
+                return "slot_too_late"
             return "allowed"
         return "offline_not_in_cache"
 
@@ -269,7 +270,8 @@ class DryRunOpener:
 class GateAgent:
     """Decides what to do with one scan. Extension points:
 
-    validate()          online decision from the server
+    validate_local()    entry decision from the cached slot, tried first
+    validate()          server decision when the cache cannot tell
     validate_offline()  fallback decision when the server is unreachable
     on_result()         add buzzer, LED or display feedback here
     """
@@ -300,30 +302,42 @@ class GateAgent:
     def _handle(self, gate, value):
         direction = gate["direction"]
         token = token_of(value.strip())
+        log.info("[%s] scanned qr=%s", direction, token[:8] or "-")
         if not token:
             return Result(False, "empty_scan")
         if self.used.has(direction, token):
             return Result(False, "used_locally")
 
-        code, resp = self.validate(value, direction)
-        offline = code == "server_unreachable"
-        if offline:
-            code, resp = self.validate_offline(token, direction)
+        code, resp, via = None, {}, "cache"
+        if direction == "entry":
+            code, resp = self.validate_local(token)
+        if code is None:
+            via = "server"
+            code, resp = self.validate(value, direction)
+            if code == "server_unreachable":
+                via = "cache"
+                code, resp = self.validate_offline(token, direction)
+        log.info("[%s] match qr=%s via %s: %s",
+                 direction, token[:8], via, code)
         if code != "allowed":
             return Result(False, code, resp)
 
         # Mark before opening so a re-scan cannot pass (guide section 3).
         self.used.add(direction, token)
         outcome = self.opener.open(gate)
+        if outcome == "opened":
+            log.info("[%s] gate opened: relay %s qr=%s", direction,
+                     gate["relay"], token[:8])
         if outcome == "failed":
             self.used.discard(direction, token)
-            if not offline:
+            if resp.get("event_id"):
                 self.cancel(resp["event_id"], "gate_failed")
             return Result(False, "gate_failed", resp)
         if outcome == "unknown":
             return Result(False, "gate_unknown", resp)
 
-        # Offline: new event_id and local authorized_at (guide section 3).
+        # Local decision: new event_id and local authorized_at (section 3).
+        # ponytail: report blocks the next scan up to timeout_s; thread it
         self.reporter.send(self.api.event_body(
             token, direction, resp.get("event_id"), resp.get("authorized_at")))
         return Result(True, resp.get("reason", "allowed"), resp)
@@ -352,18 +366,30 @@ class GateAgent:
             return resp.get("reason", "rejected"), resp
         return decision, resp
 
+    def validate_local(self, token):
+        """Decide an entry from the cached slot, without the server.
+
+        Returns (None, {}) when the cache cannot tell (QR not cached, or
+        no valid list), so the server is asked instead.
+        """
+        code = self.cache.check(token)
+        if code == "allowed":
+            return "allowed", {"reason": "local_slot"}
+        if code in ("slot_too_early", "slot_too_late"):
+            return code, {}
+        return None, {}
+
     def validate_offline(self, token, direction):
         """Decide without the server (guide "SKENARIO GANGGUAN").
 
-        Entry: token must be in the cached list and inside its slot.
-        Exit: token must have entered through this Pi.
+        Entry: validate_local() already failed, so only the deny reason is
+        left. Exit: token must have entered through this Pi.
         """
         if direction == "exit":
             if self.used.has("entry", token):
                 return "allowed", {"reason": "offline_exit"}
             return "offline_not_entered", {}
-        code = self.cache.check(token)
-        return code, {"reason": "offline_cache"} if code == "allowed" else {}
+        return self.cache.check(token), {}
 
     def cancel(self, event_id, reason):
         try:
@@ -435,12 +461,13 @@ def run_gate(agent, gate):
 
 
 def run_sync(agent, every_s):
+    """Periodic sync. main() already ran the first one at startup."""
     while True:
+        time.sleep(every_s)
         try:
             agent.sync()
         except Exception:
             log.exception("sync crashed")
-        time.sleep(every_s)
 
 
 # Main ----------------------------------------------------------------------
@@ -476,8 +503,15 @@ def main(argv=None):
                       Reporter(api, state / "pending_reports.jsonl"),
                       QrCache(state / "qr_cache.json"))
 
+    # Fill the cache before accepting scans; on failure the old file stays.
+    log.info("startup sync: downloading QR list")
+    try:
+        agent.sync()
+    except Exception:
+        log.exception("startup sync crashed")
+
     threading.Thread(target=run_sync, daemon=True, args=(
-        agent, agent_cfg.get("sync_interval_s", 300))).start()
+        agent, agent_cfg.get("sync_interval_s", 60))).start()
 
     if a.stdin:
         gate = gates[a.gate]

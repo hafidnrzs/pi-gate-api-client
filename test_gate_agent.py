@@ -82,12 +82,29 @@ def test_online():
         assert agent2.handle_scan(ENTRY, "tok1").code == "used_locally"
 
     with tempfile.TemporaryDirectory() as d:
-        # rejected: no open, reason passed through, cache never consulted
+        # cached entry is decided locally: no /validate, report after open
+        api = FakeApi()
+        agent, opener = make(d, api)
+        agent.cache.data = entries(
+            {"qr_token": "ok", "valid_until": ts(60)},
+            {"qr_token": "late", "valid_until": ts(-1)},
+            {"qr_token": "early", "valid_from": ts(10),
+             "valid_until": ts(60)})[1]
+        assert agent.handle_scan(ENTRY, "late").code == "slot_too_late"
+        assert agent.handle_scan(ENTRY, "early").code == "slot_too_early"
+        assert api.calls == [] and opener.opened == 0, api.calls
+        r = agent.handle_scan(ENTRY, "ok")
+        assert r.opened and r.code == "local_slot", r
+        assert api.calls == ["/events"], api.calls
+        # not cached: the server decides
+        assert agent.handle_scan(ENTRY, "fresh").opened
+        assert api.calls[1:] == ["/validate", "/events"], api.calls
+
+    with tempfile.TemporaryDirectory() as d:
+        # not cached and server rejects: reason passed through
         api = FakeApi(**{"/validate": (200, {"decision": "rejected",
                                              "reason": "qr_sudah_masuk"})})
         agent, opener = make(d, api)
-        agent.cache.data = entries({"qr_token": "tok2",
-                                    "valid_until": ts(60)})[1]
         r = agent.handle_scan(ENTRY, "tok2")
         assert not r.opened and r.code == "qr_sudah_masuk"
         assert opener.opened == 0
@@ -123,15 +140,15 @@ def test_offline():
         for ans in (DOWN, (502, {})):  # network error and 5xx both fall back
             api.answers["/validate"] = ans
             api.answers["/events"] = DOWN
-            assert agent.handle_scan(ENTRY, "early").code == "offline_too_early"
-            assert agent.handle_scan(ENTRY, "late").code == "offline_too_late"
+            assert agent.handle_scan(ENTRY, "early").code == "slot_too_early"
+            assert agent.handle_scan(ENTRY, "late").code == "slot_too_late"
             assert agent.handle_scan(ENTRY, "new").code == \
                 "offline_not_in_cache"
             assert agent.handle_scan(EXIT, "never").code == \
                 "offline_not_entered"
         r = agent.handle_scan(ENTRY, "ok")
-        assert r.opened and r.code == "offline_cache", r
-        # offline report uses a fresh event_id and is queued
+        assert r.opened and r.code == "local_slot", r
+        # local report with server down uses a fresh event_id and is queued
         assert api.reports[-1]["event_id"] == "new-uuid"
         pending = Path(d) / "pending.jsonl"
         assert "new-uuid" in pending.read_text()

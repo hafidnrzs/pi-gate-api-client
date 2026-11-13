@@ -220,17 +220,21 @@ barrier does not move. Success is shown in three places.
 ### Flow
 
 ```
-scanner ──scan──> gate_agent ──POST /validate──> server
+scanner ──scan──> gate_agent
                       │
           token already used locally? ──yes──> DENY used_locally
                       │
+          entry and QR in cached list? ──yes──> slot check (local only)
+                      │ no (or exit)            outside slot ─> DENY slot_too_*
+                      │                         inside slot ──> allowed
+          POST /validate to server                    │
           network error / 5xx? ──yes──> offline decision (see below)
-                      │
+                      │                               │
           decision != allowed ──────────────> DENY <reason>
-                      │ allowed
+                      │ allowed  <────────────────────┘
           mark token used (state/used_tokens.json)
                       │
-          pulse relay ── failed ──> unmark, POST /cancel (online only),
+          pulse relay ── failed ──> unmark, POST /cancel (server permit only),
                       │                DENY gate_failed
                       │   unknown ─> keep token used, DENY gate_unknown
                       │ opened
@@ -238,6 +242,10 @@ scanner ──scan──> gate_agent ──POST /validate──> server
                       │
                    OPEN
 ```
+
+An entry QR in the cached list never waits for the server: the barrier
+opens first and the report is sent after. The server is asked only for a
+QR not in the list (e.g. registered after the last sync) and for exits.
 
 | Result code          | Meaning                                                 |
 |----------------------|---------------------------------------------------------|
@@ -248,20 +256,22 @@ scanner ──scan──> gate_agent ──POST /validate──> server
 | `api_error_<status>` | 401/403/404: wrong key, IP or estate ID in `config.json` |
 | `gate_failed`        | Relay surely did not fire (ESP32 offline or refused). Permit cancelled, token can be scanned again |
 | `gate_unknown`       | Relay accepted the pulse but never confirmed. Token kept as used, no report sent |
-| `offline_cache`      | Server down, entry opened from the cached list          |
+| `local_slot`         | Entry opened from the cached list without asking the server |
 | `offline_exit`       | Server down, exit opened because this Pi recorded the entry |
 | `offline_not_in_cache` | Server down, token not in the last synced list (e.g. registered after the last sync) |
-| `offline_too_early`, `offline_too_late` | Server down, token cached but outside its slot |
+| `slot_too_early`, `slot_too_late` | Token cached but outside its slot, server not asked |
 | `offline_cache_expired` | Server down, no list synced yet or past `cache_valid_until` |
 | `offline_not_entered` | Server down, exit for a token this Pi never let in      |
 
 Each `used_locally` record is per direction, so the same QR can enter once
 and exit once.
 
-### Offline fallback
+### Cache and offline fallback
 
-A background job runs at startup and every `sync_interval_s` (default 5
-minutes, as the guide suggests):
+This job runs once at startup, before the agent accepts any scan, so the
+cache is fresh from the first scan. After that a background thread repeats
+it every `sync_interval_s` (default 1 minute, so a newly registered QR
+reaches the cache quickly):
 
 1. `GET /entries?include_upcoming=1`: QR codes whose slot is running or
    starts within 6 hours, each with `valid_from` and `valid_until`. Saved to
@@ -270,19 +280,21 @@ minutes, as the guide suggests):
 2. If the pull worked, resend queued reports with `/events/batch`, reusing
    the same `event_id` so the server counts each once.
 
-The cache is used **only** when `/validate` fails with a network error or
-HTTP 5xx. A `rejected` answer from the server is final and never replaced
-by the cache. Offline rules (guide "SKENARIO GANGGUAN"):
+Entry scans are decided from the cache first (see Flow). With the
+server asked for a QR not in the list and that call failing (network
+error or HTTP 5xx), the offline rules apply (guide "SKENARIO GANGGUAN").
+A `rejected` answer from the server is final.
 
 - **Entry**: allowed only if the token is in the last synced list,
   `valid_from <= Pi time < valid_until`, and the list is not past
-  `cache_valid_until`. A QR registered after the last sync is rejected.
+  `cache_valid_until`. This is the same check for online and offline,
+  so a QR registered after the last sync needs the server.
 - **Exit**: allowed only if this Pi recorded the token's entry. The server
   books any late fee as outstanding when the report arrives.
-- Offline opens are reported with a new `event_id` and the Pi's time as
+- Cache and offline opens are reported with a new `event_id` and the Pi's time as
   `authorized_at`, queued until the server is back.
 
-Offline decisions depend on the Pi clock. The Pi has no battery clock, so
+Cache decisions depend on the Pi clock. The Pi has no battery clock, so
 check NTP sync with `timedatectl` (`System clock synchronized: yes`).
 
 ### Configuration
@@ -294,7 +306,7 @@ The agent reads the `agent` section of the same `config.json`:
 | `relay_port`       | ESP32-C3 serial port, e.g. `/dev/ttyACM0` (a `/dev/serial/by-id/...` path survives re-plugging) |
 | `relay_driver_dir` | Folder holding `test_relay.py` from `esp32c3-relay/pi`  |
 | `state_dir`        | Runtime state, relative to this folder (default `state`) |
-| `sync_interval_s`  | Cache pull and report retry interval (default 300)      |
+| `sync_interval_s`  | Cache pull and report retry interval (default 60)       |
 | `used_token_days`  | Days a used token is remembered (default 7). Also how long after entry an offline exit still works |
 | `gates[]`          | One entry per scanner/barrier pair                      |
 | `gates[].direction`| `entry` or `exit`                                       |
@@ -358,7 +370,7 @@ server.
    `sync_interval_s`.
 4. **Offline fallback** (mock serves one cached token, `contoh-token-qr`):
    start the agent and wait for `cache synced`, then stop the mock.
-   - Scan `contoh-token-qr`: `OPEN: offline_cache` plus `report ... queued
+   - Scan `contoh-token-qr`: `OPEN: local_slot` plus `report ... queued
      for retry`.
    - Scan any other token: `DENY: offline_not_in_cache`.
    - Start the mock again. At the next sync the log shows `flushed 1 queued
